@@ -1,0 +1,6 @@
+build/*
+deps/*
+conanfile.txt
+.clang-format
+.editorconfig
+.vscode
