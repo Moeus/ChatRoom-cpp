@@ -9,11 +9,9 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-
 using namespace drogon;
 using json = nlohmann::json;
 
@@ -58,7 +56,7 @@ struct User {
 class UserRepository {
 private:
     std::unordered_map<std::string, User> users_;  // 存储在线用户的哈希表
-    std::shared_mutex mutex_;                      // 读写锁，保护用户数据
+    std::mutex mutex_;                             // 互斥锁，保护用户数据
 
 public:
     // 添加用户
@@ -67,7 +65,7 @@ public:
     std::pair<bool, std::string> addUser(const std::string& id,
                                          const std::string& nickname,
                                          const std::string& avatar) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if (users_.find(id) != users_.end()) {
             return {false, "用户已在线"};
         }
@@ -79,7 +77,7 @@ public:
     // 处理过程：加锁，从 Map 中移除指定用户 ID
     // 返回值：无
     void removeUser(const std::string& id) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         users_.erase(id);
     }
 
@@ -87,7 +85,7 @@ public:
     // 处理过程：加读锁，查询 Map
     // 返回值：bool - 存在返回 true
     bool userExists(const std::string& id) {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         return users_.find(id) != users_.end();
     }
 };
@@ -157,14 +155,6 @@ private:
         conns_;  // 存储所有活跃的 WebSocket 连接
 
 public:
-    // 获取单例实例
-    // 处理过程：使用局部静态变量实现单例模式
-    // 返回值：Broadcaster& - 单例引用
-    static Broadcaster& instance() {
-        static Broadcaster inst;
-        return inst;
-    }
-
     // 添加连接
     // 处理过程：加锁，将连接加入集合
     // 返回值：无
@@ -194,6 +184,8 @@ public:
     }
 };
 
+Broadcaster globalBroadcaster;
+
 /* ================= ChatBot ================= */
 // 聊天机器人类
 // 负责处理聊天消息，调用外部 API 生成回复
@@ -218,7 +210,7 @@ private:
         j["content"] = content;
 
         if (auto m = globalMessageRepo->saveMessage(j, "msg")) {
-            Broadcaster::instance().broadcast(m->dump());
+            globalBroadcaster.broadcast(m->dump());
         }
     }
 
@@ -315,7 +307,7 @@ private:
                {"content", "连接已关闭"}};
 
         if (auto m = globalMessageRepo->saveMessage(j, "logout")) {
-            Broadcaster::instance().broadcast(m->dump());
+            globalBroadcaster.broadcast(m->dump());
         }
     }
 
@@ -378,7 +370,7 @@ public:
                 ws->send(j.dump());
 
                 if (auto m = globalMessageRepo->saveMessage(j, "login")) {
-                    Broadcaster::instance().broadcast(m->dump());
+                    globalBroadcaster.broadcast(m->dump());
                 }
             }
             // ---- 消息 ----
@@ -393,7 +385,7 @@ public:
                 if (auto m = globalMessageRepo->saveMessage(j, "msg")) {
                     LOG_INFO << formatChatLog(ctx->nickname, ctx->userId,
                                               j.value("content", ""));
-                    Broadcaster::instance().broadcast(m->dump());
+                    globalBroadcaster.broadcast(m->dump());
 
                     // ChatBot Trigger
                     std::string content = j.value("content", "");
@@ -422,7 +414,7 @@ public:
     void handleNewConnection(const HttpRequestPtr&,
                              const WebSocketConnectionPtr& ws) override {
         ws->setContext(std::make_shared<UserContext>());
-        Broadcaster::instance().addConnection(ws);
+        globalBroadcaster.addConnection(ws);
         LOG_INFO << "WebSocket 已连接";
     }
 
@@ -430,7 +422,7 @@ public:
     // 处理过程：从订阅管理器移除连接，如果用户已登录则执行登出处理
     // 返回值：无
     void handleConnectionClosed(const WebSocketConnectionPtr& ws) override {
-        Broadcaster::instance().removeConnection(ws);
+        globalBroadcaster.removeConnection(ws);
         auto ctx = ws->getContext<UserContext>();
         if (ctx && ctx->loggedIn) {
             LOG_INFO << "WebSocket 断开连接: " << ctx->nickname << "@"
