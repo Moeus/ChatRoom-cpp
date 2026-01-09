@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -12,6 +14,10 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 using namespace drogon;
 using json = nlohmann::json;
 
@@ -35,14 +41,6 @@ inline std::string formatChatLog(const std::string& nickname,
                                  const std::string& content) {
     return nickname + "@" + userId + ": " + content;
 }
-
-// WebSocket 用户上下文
-struct UserContext {
-    std::string userId;
-    std::string nickname;
-    std::string avatar;
-    bool loggedIn = false;
-};
 
 /* ================= UserRepository ================= */
 struct User {
@@ -99,6 +97,13 @@ private:
     std::mutex mutex_;           // 互斥锁，保护消息队列
 
 public:
+    MessageRepository() {
+        initPath();
+        load();
+    }
+
+    ~MessageRepository() { save(); }
+
     // 保存消息
     // 处理过程：补充时间戳、类型、ID，存入内存队列，并维持最大历史记录数量
     // 返回值：std::optional<json> - 成功返回处理后的完整消息 JSON，失败返回
@@ -139,6 +144,71 @@ public:
             arr.push_back(msg);
         }
         return arr;
+    }
+
+private:
+    std::string dbPath_;
+
+    void initPath() {
+        std::filesystem::path exeDir;
+#ifdef _WIN32
+        char path[MAX_PATH];
+        GetModuleFileNameA(NULL, path, MAX_PATH);
+        exeDir = std::filesystem::path(path).parent_path();
+#else
+        // Linux/Unix fallback (not strictly required by user but good practice)
+        exeDir = std::filesystem::current_path();
+#endif
+        dbPath_ = (exeDir / "message.json").string();
+    }
+
+    void load() {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!std::filesystem::exists(dbPath_)) {
+            LOG_INFO << "未发现历史消息文件: " << dbPath_;
+            return;
+        }
+
+        try {
+            std::ifstream f(dbPath_);
+            if (f.is_open()) {
+                json j;
+                f >> j;
+                if (j.is_array()) {
+                    messages_.clear();
+                    for (auto& m : j) {
+                        messages_.push_back(m);
+                    }
+                    LOG_INFO << "成功加载 " << messages_.size()
+                             << " 条历史消息 from " << dbPath_;
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR << "加载历史消息失败: " << e.what();
+        }
+    }
+
+    void save() {
+        // limit lock scope? Destructor is usually exclusive, but just in case.
+        // Actually for destructor, if other threads are accessing, we have
+        // bigger problems. But let's lock to be safe if this is called manually
+        // (though it's private).
+        std::lock_guard<std::mutex> lock(mutex_);
+        try {
+            std::ofstream f(dbPath_);
+            if (f.is_open()) {
+                json arr = json::array();
+                for (const auto& m : messages_) {
+                    arr.push_back(m);
+                }
+                f << arr.dump(4);  // pretty print
+                LOG_INFO << "聊天记录已保存至: " << dbPath_;
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR << "保存历史消息失败: " << e.what();
+        }
     }
 };
 
@@ -198,10 +268,11 @@ private:
         return "sk-e8d96cc5d63a4c9eb8acdcac9396b701";
     }
 
+public:
     // 广播回复
     // 处理过程：构造机器人的消息 JSON 对象，保存并广播
     // 返回值：无
-    static void broadcastResponse(const std::string& content) {
+    static void broadcastBotMessage(const std::string& content) {
         json j;
         j["type"] = "msg";
         j["userId"] = "bot_001";
@@ -214,7 +285,6 @@ private:
         }
     }
 
-public:
     // 处理消息
     // 处理过程：构造请求发送给 OpenAI 兼容接口，接收响应并广播
     // 返回值：无
@@ -270,7 +340,7 @@ public:
                     if (body.contains("choices") && !body["choices"].empty()) {
                         std::string content =
                             body["choices"][0]["message"]["content"];
-                        ChatBot::broadcastResponse(content);
+                        ChatBot::broadcastBotMessage(content);
                     }
                 } catch (...) {
                     LOG_ERROR << "解析 OpenAI 响应失败";
@@ -284,6 +354,13 @@ public:
 };
 
 /* ================= WebSocket Controller ================= */
+// WebSocket 用户上下文
+struct UserContext {
+    std::string userId;
+    std::string nickname;
+    std::string avatar;
+    bool loggedIn = false;
+};
 // WebSocket 控制器类
 // 负责处理 WebSocket 连接建立、消息接收和断开连接事件
 class ChatWebSocket : public WebSocketController<ChatWebSocket> {
@@ -367,10 +444,13 @@ public:
                 }
 
                 j["state"] = true;
-                ws->send(j.dump());
 
                 if (auto m = globalMessageRepo->saveMessage(j, "login")) {
                     globalBroadcaster.broadcast(m->dump());
+                    ChatBot::broadcastBotMessage(
+                        "@" + ctx->nickname +
+                        " 你好! 欢迎来到聊天室! 我是聊天室的 AI 助手 "
+                        "ChatBot。使用 @ChatBot 召唤我，就能与我进行对话交流");
                 }
             }
             // ---- 消息 ----
@@ -442,9 +522,6 @@ public:
 // 服务器 返回值：int - 程序退出代码
 #include <drogon/drogon.h>
 
-#include <filesystem>
-#include <iostream>
-
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -463,7 +540,8 @@ int main() {
 
     // 拼接出 dist 的绝对路径
     std::filesystem::path distPath = exeDir / "dist";
-    auto spaResp = drogon::HttpResponse::newFileResponse(distPath.string() +"/index.html");
+    auto spaResp = drogon::HttpResponse::newFileResponse(distPath.string() +
+                                                         "/index.html");
     spaResp->setStatusCode(drogon::k200OK);
     if (std::filesystem::exists(distPath)) {
         LOG_INFO << "前端静态资源目录定位成功: " << distPath.string();
@@ -476,8 +554,8 @@ int main() {
     LOG_INFO << "请使用浏览器访问 127.0.0.1:9001";
 
     drogon::app()
-        .setDocumentRoot(distPath.string())  
-        .setHomePage("index.html")           
+        .setDocumentRoot(distPath.string())
+        .setHomePage("index.html")
         .addListener("0.0.0.0", 9001)
         .setCustom404Page(spaResp, false)
         .setThreadNum(4)
