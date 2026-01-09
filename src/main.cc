@@ -421,11 +421,8 @@ public:
                 auto [success, errMsg] =
                     globalUserRepo->addUser(uid, nick, avt);
                 if (!success) {
-                    ws->send(json{
-                        {"type", "login"},
-                        {"state", false},
-                        {"content",
-                         errMsg}}.dump());
+                    j["state"]=false;
+                    ws->send(j.dump());
                     return;
                 }
 
@@ -520,11 +517,6 @@ public:
 // 主函数
 // 处理过程：配置 Windows 控制台编码，设置日志级别，启动 Drogon HTTP/WebSocket
 // 服务器 返回值：int - 程序退出代码
-#include <drogon/drogon.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 int main() {
     std::filesystem::path exeDir;
